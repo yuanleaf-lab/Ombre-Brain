@@ -199,7 +199,9 @@ class APIEmbeddingEngine(BaseEmbeddingEngine):
         dim: int = _GEMINI_DEFAULT_DIM,
         timeout_seconds: float = _API_TIMEOUT_SECONDS,
         api_format: str = "openai_compat",
+        read_only: bool = False,
     ):
+        self.read_only = read_only
         self.api_key = api_key
         self.base_url = base_url
         self.api_format = (api_format or "openai_compat").strip().lower()
@@ -265,12 +267,16 @@ class APIEmbeddingEngine(BaseEmbeddingEngine):
                     return list(vec)
             # 拿到了 2xx 响应但没有可用向量 —— 不能静默返回 []，否则向量化「成功
             # 调用却没结果」会无声无息（#3）。记 OB-E001 让错误面板可见。
+            if self.read_only:
+                raise RuntimeError("read-only embedding provider returned an empty vector")
             self._record_e001(
                 f"backend={self.backend_name} model={self.model} 返回空向量"
                 f"（base_url={self.base_url}，检查 model 名 / base_url / key 是否匹配该 provider）"
             )
             return []
         except Exception as e:
+            if self.read_only:
+                raise RuntimeError("read-only embedding provider request failed") from e
             _hint = _humanize_api_error(
                 e,
                 api_format=self.api_format,
@@ -310,7 +316,9 @@ class GeminiNativeEmbeddingEngine(BaseEmbeddingEngine):
         model: str,
         dim: int = _GEMINI_DEFAULT_DIM,
         timeout_seconds: float = _API_TIMEOUT_SECONDS,
+        read_only: bool = False,
     ):
+        self.read_only = read_only
         self.api_key = api_key
         self.model = model
         self._dim = dim
@@ -349,11 +357,15 @@ class GeminiNativeEmbeddingEngine(BaseEmbeddingEngine):
                 self._dim = len(values)
             if values:
                 return list(values)
+            if self.read_only:
+                raise RuntimeError("read-only embedding provider returned an empty vector")
             self._record_e001(
                 f"backend=gemini_native model={self.model} 返回空向量（检查模型名是否支持 embedContent）"
             )
             return []
         except Exception as e:
+            if self.read_only:
+                raise RuntimeError("read-only embedding provider request failed") from e
             self._record_e001(
                 f"backend=gemini_native model={self.model} err={type(e).__name__}: {e}"
             )
@@ -408,6 +420,7 @@ class EmbeddingEngine:
     """SQLite 存储 + 搜索 + 元数据校验，持有一颗 BaseEmbeddingEngine。"""
 
     def __init__(self, config: dict):
+        self.read_only = config.get("read_only") is True
         self.v3_runtime = None
         # 进程内小容量 LRU：provider 输入摘要 -> embedding。缓存键不能保留完整
         # 桶正文；后端只会看到前 _MAX_INPUT_CHARS 个字符，identity 也必须遵守
@@ -437,7 +450,7 @@ class EmbeddingEngine:
 
         if not enabled_cfg:
             # 显式关闭：no-op 模式，仍初始化 db 让 list_all_ids 能跑
-            self._init_db()
+            self._init_read_only_db() if self.read_only else self._init_db()
             return
 
         # 解析 api_format（提前到 key 检查之前）。本地 ollama/local 后端无需真实 key，
@@ -461,6 +474,8 @@ class EmbeddingEngine:
             api_key = "ollama"
 
         if not _header_safe(api_key):
+            if self.read_only:
+                raise RuntimeError("read-only embedding provider configuration is invalid")
             # key 里有非 ASCII 字符（多半是粘贴时混进了全角字符或中文）。
             # 它会被塞进 `Authorization: Bearer <key>` 请求头，而 HTTP 头只收
             # ASCII——于是每一次向量化都抛 UnicodeEncodeError，报错位置还落在
@@ -473,13 +488,15 @@ class EmbeddingEngine:
                 "无法作为 HTTP 请求头发送；多为粘贴时混入全角字符。"
                 "已进入待机（向量化关闭），改正 key 后自动激活。"
             )
-            self._init_db()
+            self._init_read_only_db() if self.read_only else self._init_db()
             return
 
         if not api_key:
+            if self.read_only:
+                raise RuntimeError("read-only embedding provider credentials are missing")
             # 无 key（仅云端后端会走到这）→ 待机模式：enabled=False，DB 仍初始化，key 热更新后激活
             logger.warning("[embedding] enabled=true but no api_key — starting in standby (disabled); set OMBRE_EMBED_API_KEY to activate")
-            self._init_db()
+            self._init_read_only_db() if self.read_only else self._init_db()
             return
 
         if is_local:
@@ -516,6 +533,7 @@ class EmbeddingEngine:
                 dim=dim,
                 timeout_seconds=timeout_seconds,
                 api_format=api_format,
+                read_only=self.read_only,
             )
         elif api_format == "gemini":
             model = embed_cfg.get("model") or "gemini-embedding-001"
@@ -523,6 +541,7 @@ class EmbeddingEngine:
                 api_key=api_key,
                 model=model,
                 timeout_seconds=timeout_seconds,
+                read_only=self.read_only,
             )
         else:
             model = embed_cfg.get("model") or "gemini-embedding-001"
@@ -546,14 +565,41 @@ class EmbeddingEngine:
                 dim=dim,
                 timeout_seconds=timeout_seconds,
                 api_format=api_format,
+                read_only=self.read_only,
             )
 
         self.model = self._backend.model_name()
         self.enabled = True
 
         # 5) 初始化 SQLite + 校验元数据
-        self._init_db()
-        self._check_meta_consistency()
+        if self.read_only:
+            self._init_read_only_db()
+        else:
+            self._init_db()
+            self._check_meta_consistency()
+
+    def _connect_db(self):
+        if not self.read_only:
+            return sqlite3.connect(self.db_path)
+        from pathlib import Path
+        if not os.path.isfile(self.db_path):
+            raise RuntimeError("read-only embedding database is missing")
+        conn = sqlite3.connect(Path(self.db_path).resolve().as_uri() + "?mode=ro", uri=True)
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+
+    def _init_read_only_db(self) -> None:
+        conn = self._connect_db()
+        try:
+            result = conn.execute("PRAGMA quick_check").fetchone()
+            if not result or result[0] != "ok":
+                raise RuntimeError("read-only embedding database integrity check failed")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
+            if not {"bucket_id", "embedding", "meaning_embedding", "content_hash"} <= columns:
+                raise RuntimeError("read-only embedding database schema is incompatible")
+            conn.execute("SELECT key, value FROM embeddings_meta LIMIT 1").fetchone()
+        finally:
+            conn.close()
 
     def attach_v3_runtime(self, runtime) -> None:
         self.v3_runtime = runtime
@@ -605,7 +651,7 @@ class EmbeddingEngine:
         converted = 0
         after_rowid = 0
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._connect_db()
         except sqlite3.Error:
             return
         try:
@@ -666,7 +712,7 @@ class EmbeddingEngine:
     def _create_tables(self) -> None:
         """建表。embeddings 主表 + embeddings_meta 元数据表（2.0.3 新增）。"""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS embeddings (
@@ -702,7 +748,7 @@ class EmbeddingEngine:
             conn.close()
 
     def _read_meta(self) -> dict[str, str]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             rows = conn.execute("SELECT key, value FROM embeddings_meta").fetchall()
             return {k: v for k, v in rows}
@@ -710,7 +756,7 @@ class EmbeddingEngine:
             conn.close()
 
     def _write_meta(self, key: str, value: str) -> None:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO embeddings_meta (key, value) VALUES (?, ?)",
@@ -729,7 +775,7 @@ class EmbeddingEngine:
         if not self._backend:
             return
         meta = self._read_meta()
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             cnt = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
         finally:
@@ -833,7 +879,7 @@ class EmbeddingEngine:
             from utils import now_iso  # type: ignore
         except ImportError:
             from .utils import now_iso  # type: ignore
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             conn.execute(
                 """INSERT INTO embeddings (bucket_id, embedding, updated_at, content_hash)
@@ -871,7 +917,7 @@ class EmbeddingEngine:
             from utils import now_iso  # type: ignore
         except ImportError:
             from .utils import now_iso  # type: ignore
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             conn.execute(
                 """INSERT INTO embeddings (bucket_id, embedding, updated_at, content_hash, meaning_embedding)
@@ -885,7 +931,7 @@ class EmbeddingEngine:
             conn.close()
 
     def delete_embedding(self, bucket_id: str) -> None:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
             conn.commit()
@@ -894,7 +940,7 @@ class EmbeddingEngine:
 
     def list_all_ids(self) -> list[str]:
         """孤儿对账用：embeddings 表里所有 bucket_id。"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             rows = conn.execute("SELECT bucket_id FROM embeddings").fetchall()
             return [r[0] for r in rows]
@@ -903,7 +949,7 @@ class EmbeddingEngine:
 
     def delete_meaning_embedding(self, bucket_id: str) -> None:
         """清空 meaning 派生列，保留同桶的 content 向量。"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             conn.execute(
                 "UPDATE embeddings SET meaning_embedding = NULL WHERE bucket_id = ?",
@@ -927,7 +973,7 @@ class EmbeddingEngine:
         ``content_hash`` after the schema migration while still holding a valid
         vector. Inspecting the vector column keeps those two states distinct.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             rows = conn.execute(
                 "SELECT bucket_id FROM embeddings WHERE TRIM(embedding) <> ''"
@@ -938,7 +984,7 @@ class EmbeddingEngine:
 
     def list_content_hashes(self) -> dict[str, str]:
         """Return hashes recorded by new writes; legacy rows contain ``""``."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             rows = conn.execute(
                 "SELECT bucket_id, content_hash FROM embeddings"
@@ -948,7 +994,7 @@ class EmbeddingEngine:
             conn.close()
 
     def get_content_hash(self, bucket_id: str) -> str:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             row = conn.execute(
                 "SELECT content_hash FROM embeddings WHERE bucket_id = ?", (bucket_id,)
@@ -958,7 +1004,7 @@ class EmbeddingEngine:
             conn.close()
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             row = conn.execute(
                 "SELECT embedding FROM embeddings WHERE bucket_id = ?", (bucket_id,)
@@ -986,7 +1032,7 @@ class EmbeddingEngine:
 
         # Preserve the old behaviour of not calling the provider for an empty
         # index, without retaining any embedding payload across the await.
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             has_rows = conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone()
         finally:
@@ -1008,7 +1054,7 @@ class EmbeddingEngine:
         top_results: list[tuple[float, int, str]] = []
         row_index = 0
         query_dim = len(query_embedding)
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect_db()
         try:
             cursor = conn.execute(
                 "SELECT bucket_id, embedding, meaning_embedding FROM embeddings"
@@ -1047,12 +1093,16 @@ class EmbeddingEngine:
                         try:
                             stored_embedding = decode_vector(raw_embedding)
                         except (json.JSONDecodeError, ValueError, TypeError) as _emb_exc:
+                            if self.read_only:
+                                raise RuntimeError("read-only vector index contains malformed data") from _emb_exc
                             logger.warning(
                                 f"[embedding] Skipping malformed {label} for {bucket_id!r}: "
                                 f"{type(_emb_exc).__name__}: {_emb_exc}"
                             )
                             continue
                         if stored_embedding.size != query_dim:
+                            if self.read_only:
+                                raise RuntimeError("read-only vector index dimension mismatch")
                             # Preserve the pairwise helper's existing contract:
                             # a dimension mismatch contributes a 0.0 score.
                             logger.warning(
@@ -1157,7 +1207,7 @@ class EmbeddingEngine:
                 "embedding_count": 0,
             }
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._connect_db()
             try:
                 cnt = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
             finally:

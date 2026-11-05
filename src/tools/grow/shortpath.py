@@ -71,9 +71,10 @@ async def grow_shortpath(content: str, test_data: bool = False) -> str:
         test_data=test_data,
     )
     action = "合并" if is_merged else "新建"
-    asyncio.create_task(check_plan_resolution(content, source_bucket_id=result_name))
-    if not is_merged:
-        asyncio.create_task(check_duplicate_for(result_name, content.strip()))
+    if not rt.config.get("memory_write_adapter", False):
+        asyncio.create_task(check_plan_resolution(content, source_bucket_id=result_name))
+        if not is_merged:
+            asyncio.create_task(check_duplicate_for(result_name, content.strip()))
     result = (
         "短内容已按 hold 路径保存为单条记忆，没有拆分。\n"
         f"{action} → {result_name} | "

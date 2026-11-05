@@ -171,10 +171,11 @@ async def grow_core(content: str, test_data: bool = False) -> str:
         if embed_warn and embed_warn not in embed_warnings:
             embed_warnings.append(embed_warn)
         dup_check = outcome.get("dup_check")
-        if dup_check:
+        if dup_check and not rt.config.get("memory_write_adapter", False):
             asyncio.create_task(check_duplicate_for(*dup_check))
 
-    asyncio.create_task(check_plan_resolution(content))
+    if not rt.config.get("memory_write_adapter", False):
+        asyncio.create_task(check_plan_resolution(content))
     summary = f"{len(items)}条|新{created}合{merged} batch:{batch_id}\n" + "\n".join(results)
     if embed_warnings:
         summary += f"\n⚠️ {embed_warnings[0]}"
@@ -357,10 +358,11 @@ async def grow_items(items: list, source_content: str = "", test_data: bool = Fa
         if outcome.get("metadata_fallback"):
             metadata_fallback = True
         dup_check = outcome.get("dup_check")
-        if dup_check:
+        if dup_check and not rt.config.get("memory_write_adapter", False):
             asyncio.create_task(check_duplicate_for(*dup_check))
 
-    asyncio.create_task(check_plan_resolution("\n".join(item["content"] for item in clean)))
+    if not rt.config.get("memory_write_adapter", False):
+        asyncio.create_task(check_plan_resolution("\n".join(item["content"] for item in clean)))
     summary = f"{len(clean)}条(预拆分·逐字)|新{created}合{merged} batch:{batch_id}\n" + "\n".join(results)
     if embed_warnings:
         summary += f"\n⚠️ {embed_warnings[0]}"

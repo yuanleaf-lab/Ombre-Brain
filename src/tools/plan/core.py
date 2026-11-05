@@ -26,17 +26,21 @@ breath 中。
 
 import json
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from .. import _runtime as rt
 from .._common import (
+    _content_turn,
+    append_plan_change_log,
     check_content_size,
     check_metadata_size,
     check_query_size,
 )
 from utils import strip_wikilinks, get_ai_name, get_owner_name, get_tzinfo, get_timezone_name
 from errors import ToolInputError, safe_error_detail
+from ombrebrain.storage.metadata_normalize import _sanitize_text
 # 锁语义 3.6.5 下沉到 ombrebrain/storage/letter_lock.py：you / them 的证据闸
 # 也要判「这封信对 AI 开没开」，而 ombrebrain 不能反向 import tools。
 # 这里按原名再导出，所有既有调用点不变。
@@ -187,13 +191,23 @@ def safe_letter_metadata(bucket: dict, caller_side: str | None) -> dict:
     return payload
 
 
+@dataclass(frozen=True)
+class PlanCreateResult:
+    status: str
+    bucket_id: str | None = None
+    duplicate: bool = False
+    error: str | None = None
+
+
 async def plan_create(
     content: str,
     status: Optional[str] = "active",
     related_bucket: Optional[str] = "",
     weight: Optional[float] = 0.5,
     why_remembered: Optional[str] = "",
-) -> str:
+    *,
+    structured: bool = False,
+) -> str | PlanCreateResult:
     if status is None:
         status = "active"
     if related_bucket is None:
@@ -227,46 +241,85 @@ async def plan_create(
     if status not in ("active", "resolved", "abandoned"):
         status = "active"
 
-    norm = content.strip()
-    try:
-        all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
-        for b in all_buckets:
-            m = b.get("metadata", {})
-            if (
-                m.get("type") == "plan"
-                and m.get("status", "active") == "active"
-                and (b.get("content") or "").strip() == norm
-            ):
-                return f"跟原有 active plan 完全重复→{b['id']}（未重复登记）"
-    except Exception as e:
-        rt.logger.warning(f"plan() dedup scan failed: {e}")
+    norm = _sanitize_text(content).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not norm:
+        raise ToolInputError("内容为空，无法登记计划。")
 
-    bucket_id = await rt.bucket_mgr.create(
-        content=content.strip(),
-        tags=["__plan__"],
-        importance=7,
-        domain=["plan"],
-        valence=0.5,
-        arousal=0.4,
-        name=None,
-        bucket_type="plan",
-        why_remembered=why_remembered,
-        weight=weight,
-        source_tool="plan",
-        event_actor="llm",
-    )
-    from .._common import append_plan_change_log
+    # The normal OB tool and the reviewed adapter share this native lease.
+    # Use Markdown truth inside it, never a process's cached active listing.
+    async with _content_turn(norm):
+        result = await _create_plan_locked(norm, status, related_bucket.strip(), weight, why_remembered)
+    if structured:
+        return result
+    if result.status == "succeeded":
+        if result.duplicate:
+            return f"跟原有 active plan 完全重复→{result.bucket_id}（未重复登记）"
+        return f"📋plan→{result.bucket_id} [{status}]"
+    target = f" {result.bucket_id}" if result.bucket_id else ""
+    return f"⚠️ plan [{result.status}]{target}。落盘结果未完整确认，请先核对，避免重复登记。"
+
+
+async def _create_plan_locked(content, status, related_bucket, weight, why_remembered) -> PlanCreateResult:
+    duplicate = rt.bucket_mgr.find_exact_content(content, active_plan=True)
+    if duplicate:
+        meta = duplicate["metadata"]
+        if meta.get("source_tool") == "plan":
+            # A native create can leave an active-looking body before the
+            # second write. A new request ID must not turn it into success.
+            history = meta.get("change_log")
+            has_creation = isinstance(history, list) and any(
+                isinstance(entry, dict) and entry.get("action") == "created"
+                and entry.get("by") == "plan" and entry.get("ts")
+                and entry.get("to") in ("active", "resolved", "abandoned")
+                for entry in history
+            )
+            if meta.get("status") != "active" or not has_creation:
+                return PlanCreateResult("partial", duplicate["id"], duplicate=True,
+                                        error="plan_metadata_incomplete")
+        return PlanCreateResult("succeeded", duplicate["id"], duplicate=True)
+
+    try:
+        bucket_id = await rt.bucket_mgr.create(
+            content=content,
+            tags=["__plan__"],
+            importance=7,
+            domain=["plan"],
+            valence=0.5,
+            arousal=0.4,
+            name=None,
+            bucket_type="plan",
+            why_remembered=why_remembered,
+            weight=weight,
+            source_tool="plan",
+            event_actor="llm",
+        )
+    except OSError:
+        return PlanCreateResult("indeterminate", error="plan_create_unconfirmed")
     initial_log = append_plan_change_log([], "created", to=status, by="plan")
     update_kwargs = {"status": status, "change_log": initial_log}
-    if related_bucket.strip():
-        update_kwargs["related_bucket"] = related_bucket.strip()
+    if related_bucket:
+        update_kwargs["related_bucket"] = related_bucket
     try:
         await rt.bucket_mgr.update(bucket_id, **update_kwargs)
     except Exception as e:
-        rt.logger.warning(f"plan() failed to set status/related: {e}")
-    # 注意：bucket_mgr.create() 已在 content 落盘后投递 embedding outbox
-    # 向量，这里不需要也不应该重复调用 generate_and_store（见 hold/feel.py 同类注释）。
-    return f"📋plan→{bucket_id} [{status}]"
+        rt.logger.warning("plan() metadata update raised %s; verifying disk state", type(e).__name__)
+
+    try:
+        persisted = await rt.bucket_mgr.get(bucket_id)
+    except Exception as e:
+        rt.logger.warning("plan() readback raised %s", type(e).__name__)
+        return PlanCreateResult("indeterminate", bucket_id, error="plan_readback_unavailable")
+    if not persisted or persisted.get("id") != bucket_id:
+        return PlanCreateResult("indeterminate", bucket_id, error="plan_readback_unavailable")
+    meta = persisted["metadata"]
+    history = meta.get("change_log")
+    if (persisted["content"] != content or meta.get("type") != "plan" or
+            meta.get("status") != status or meta.get("weight") != weight or
+            (why_remembered and meta.get("why_remembered") != why_remembered) or
+            (meta.get("related_bucket") or "") != related_bucket or
+            not isinstance(history, list) or initial_log[0] not in history):
+        return PlanCreateResult("partial", bucket_id, error="plan_metadata_incomplete")
+    return PlanCreateResult("succeeded", bucket_id)
 
 
 async def letter_write(

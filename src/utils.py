@@ -56,7 +56,7 @@ _TOKEN_RATIO_PER_CHAR = 0.05     # 标点/空格等其它字符的兜底贡献
 # setup_logging() 文件日志轮转配置。
 _LOG_FILE_MAX_BYTES = 1_000_000  # 单个日志文件 1 MB 后轮转
 _LOG_FILE_BACKUP_COUNT = 3       # 保留 3 个历史文件
-_LOG_FALLBACK_DIR = os.path.join(tempfile.gettempdir(), "ombre_logs")
+_LOG_FALLBACK_DIR = None  # Resolve lazily: gettempdir() probes by writing files.
 
 # sanitize_name() 桶名最大长度（防止文件名过长导致 OS 报错）。
 _BUCKET_NAME_MAX_LEN = 80
@@ -413,6 +413,7 @@ def load_config(config_path: Optional[str] = None) -> dict:
     # --- 内置默认配置（兜底，保证即使没有 config.yaml 也能跑）---
     defaults = {
         "transport": "stdio",
+        "read_only": False,
         "log_level": "INFO",
         "mcp_require_auth": True,
         # 只有 mcp_require_auth=true 时才生效：OAuth、静态 Token 或两者共存。
@@ -484,6 +485,7 @@ def load_config(config_path: Optional[str] = None) -> dict:
     config["mcp_require_auth"] = parse_bool(
         config.get("mcp_require_auth", True), default=True
     )
+    config["read_only"] = parse_bool(config.get("read_only", False), default=False)
 
     # --- Environment variable overrides (highest priority) ---
     # --- 环境变量覆盖敏感/运行时配置（优先级最高）---
@@ -775,7 +777,7 @@ def _resolve_log_dir(explicit: str | None) -> str:
     bd = os.environ.get("OMBRE_BUCKETS_DIR", "").strip()
     if bd:
         return os.path.join(bd, ".logs")
-    return _LOG_FALLBACK_DIR
+    return _LOG_FALLBACK_DIR or os.path.join(tempfile.gettempdir(), "ombre_logs")
 
 
 def setup_logging(level: str = "INFO", log_dir: str | None = None) -> None:
