@@ -205,6 +205,8 @@ async def surface_plans(max_tokens: int) -> str:
             out += f"\n\n另有 {omitted} 条 plan 因 token 预算不足未返回；正文未截断或摘要。"
         return out
     except Exception as e:
+        if rt.config.get("read_only", False):
+            raise RuntimeError("read-only plan retrieval failed") from e
         rt.logger.error(f"Plan retrieval failed: {e}")
         return "读取 plan 失败。"
 
@@ -220,6 +222,8 @@ async def surface_default(
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
         rt.logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
+        if rt.config.get("read_only", False):
+            raise RuntimeError("read-only bootstrap failed") from e
         return "记忆系统暂时无法访问。"
 
     # 3.6.0：无 query 的浮现路径此前完全不认 date_from/date_to——参数收下了、
@@ -433,7 +437,7 @@ async def surface_default(
                 used=max_tokens - token_budget,
                 limit=max_tokens,
             )
-        if rt.mark_op:
+        if rt.mark_op and not rt.config.get("read_only", False):
             rt.mark_op("breath_empty")
         stats = await rt.bucket_mgr.get_stats()
         total = stats.get("permanent_count", 0) + stats.get("dynamic_count", 0)

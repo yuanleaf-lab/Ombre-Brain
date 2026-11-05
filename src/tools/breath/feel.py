@@ -45,9 +45,16 @@ async def _semantic_hits(query: str, feel_ids: set[str]) -> tuple[dict[str, floa
     """在 feel 集合内做向量检索，返回 {bucket_id: 相似度} 与降级提示。"""
     engine = rt.embedding_engine
     if not engine or not getattr(engine, "enabled", False):
+        if rt.config.get("read_only", False):
+            if (rt.config.get("embedding") or {}).get("enabled") is not False:
+                raise RuntimeError("read-only feel semantic engine unavailable; fallback refused")
+            return {}, "[只读模式：语义检索已显式关闭，仅使用字面匹配。]"
         return {}, _SEMANTIC_DISABLED_NOTE
     try:
-        pairs = await engine.search_similar(
+        search = engine.search_similar
+        if rt.config.get("read_only", False):
+            search = engine.search_similar_strict
+        pairs = await search(
             query,
             top_k=max(len(feel_ids), 1),
             allowed_bucket_ids=set(feel_ids),
@@ -58,6 +65,8 @@ async def _semantic_hits(query: str, feel_ids: set[str]) -> tuple[dict[str, floa
             if float(score) >= _FEEL_SEMANTIC_THRESHOLD
         }, ""
     except Exception as exc:
+        if rt.config.get("read_only", False):
+            raise RuntimeError("read-only feel semantic search failed; fallback refused") from exc
         rt.logger.warning(
             f"feel semantic search failed; falling back to literal match: "
             f"{type(exc).__name__}: {exc}"
@@ -136,6 +145,8 @@ async def surface_feels(
             out += f"\n\n另有 {omitted} 条相关 feel 因 token 预算不足未返回；正文未截断或摘要。"
         return out
     except Exception as e:
+        if rt.config.get("read_only", False):
+            raise RuntimeError("read-only feel retrieval failed") from e
         # 到这里说明我没想到。
         # 咪。
         rt.logger.error(f"Feel retrieval failed: {e}")

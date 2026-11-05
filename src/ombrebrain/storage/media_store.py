@@ -41,13 +41,15 @@ class MediaStore:
         *,
         max_bytes: int = _DEFAULT_MAX_MEDIA_BYTES,
         max_items: int = _DEFAULT_MAX_MEDIA_ITEMS,
+        read_only: bool = False,
     ) -> None:
         self.vault_dir = Path(vault_dir).resolve()
         self.media_dir = Path(media_dir).resolve()
         self.max_bytes = max(1, int(max_bytes))
         self.max_items = max(1, int(max_items))
-        self.allowed_roots = self._default_allowed_roots()
-        self.media_dir.mkdir(parents=True, exist_ok=True)
+        self.allowed_roots = () if read_only else self._default_allowed_roots()
+        if not read_only:
+            self.media_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _default_allowed_roots() -> tuple[Path, ...]:

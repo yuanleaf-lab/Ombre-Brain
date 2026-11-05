@@ -1,0 +1,19 @@
+# Independent configuration. Copy this file outside the normal OB configuration.
+# Replace the Vault path with an existing TEST Vault for acceptance.
+read_only: true
+transport: stdio
+buckets_dir: "C:/ABSOLUTE/PATH/TO/EXISTING/TEST/VAULT"
+auth:
+  # SHA-256 of a randomly generated token of at least 32 characters.
+  # Supply the token only via MEMORY_MCP_TOKEN in the launching client's env.
+  token_sha256: "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS"
+embedding:
+  enabled: true
+  api_format: ollama
+  model: bge-m3
+  dim: 1024
+  base_url: "http://127.0.0.1:11434/v1"
+  timeout_seconds: 120
+surfacing:
+  breath_max_results: 10
+  breath_max_tokens: 20000

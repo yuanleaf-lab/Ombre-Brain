@@ -50,6 +50,8 @@ async def surface_catalog(
     try:
         buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
+        if rt.config.get("read_only", False):
+            raise RuntimeError("read-only catalog failed") from e
         return f"获取记忆目录失败: {safe_error_detail(e)}"
 
     if not buckets:

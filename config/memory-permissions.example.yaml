@@ -1,0 +1,14 @@
+# Optional SECTION for an independent memory stdio/HTTP TEST configuration.
+# This is not a complete launch config. Do not merge it into native config.yaml.
+# Omitting this section preserves the original three-tool service.
+permissions:
+  write_enabled: false
+  tools:
+    - memory_bootstrap
+    - memory_search
+    - memory_read
+    - memory_catalog
+    - memory_status
+    - memory_feel_search
+    - memory_plan_list
+    - memory_self_read

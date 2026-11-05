@@ -550,6 +550,7 @@ class BucketManager:
             # 同一个上限传下去，让 MediaStore 在动手持久化之前就拒绝超量，
             # 而不是逐项写完再由下面的 _normalize_media 截断。
             max_items=_MEDIA_MAX_ITEMS,
+            read_only=config.get("read_only", False),
         )
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
@@ -593,7 +594,9 @@ class BucketManager:
         self.ledger_mirror = LedgerMirror(ledger_path)
 
         # BM25 稀疏索引（写操作后脏标记，search() 时懒重建）
-        self._bm25: "_BM25Index | None" = _BM25Index() if _BM25Index is not None else None
+        self._bm25: "_BM25Index | None" = (
+            _BM25Index() if _BM25Index is not None and not config.get("read_only", False) else None
+        )
         self._bm25_dirty: bool = True
         self._bm25_rebuilding: bool = False  # Avoid concurrent duplicate rebuilds.
 
@@ -833,7 +836,10 @@ class BucketManager:
         for dir_path in dirs:
             if not os.path.exists(dir_path):
                 continue
-            for root, _, files in os.walk(dir_path):
+            def onerror(exc):
+                if self.config.get("read_only", False):
+                    raise exc
+            for root, _, files in os.walk(dir_path, onerror=onerror):
                 for fname in files:
                     if not fname.endswith(".md"):
                         continue
@@ -1219,6 +1225,8 @@ class BucketManager:
         current: list[dict],
     ) -> None:
         """Propagate externally-created/edited/deleted Markdown to derived state."""
+        if self.config.get("read_only", False):
+            return
         old_by_id = {str(bucket.get("id") or ""): bucket for bucket in previous}
         new_by_id = {str(bucket.get("id") or ""): bucket for bucket in current}
         old_by_id.pop("", None)
@@ -1349,6 +1357,8 @@ class BucketManager:
 
     async def _rebuild_bm25_async(self, buckets: list) -> None:
         """后台重建 BM25：to_thread 里建新索引，建好原子换入 self._bm25，不阻塞事件循环。"""
+        if self.config.get("read_only", False):
+            raise PermissionError("read-only mode forbids BM25 rebuild")
         try:
             fresh = await asyncio.to_thread(self._build_bm25_index, buckets)
             self._bm25 = fresh          # 原子替换（单次赋值）
@@ -3421,7 +3431,7 @@ class BucketManager:
         # 脏且没人在重建 → 起一个后台重建；本次查询用「当前索引」打分（首次为空，
         # 之后是上一版，略旧但有效）。向量+模糊+字面召回仍在，单次查询不会因 BM25 卡住。
         bm25_scores: dict[str, float] = {}
-        if self._bm25 is not None:
+        if self._bm25 is not None and not self.config.get("read_only", False):
             if self._bm25_dirty and not self._bm25_rebuilding:
                 self._bm25_rebuilding = True
                 asyncio.create_task(self._rebuild_bm25_async(all_buckets))
@@ -3947,6 +3957,13 @@ class BucketManager:
         if not bucket_id:
             return None
 
+        if self.config.get("read_only", False):
+            # Another OB process can publish new IDs between two reads.
+            # Never trust a cached negative lookup in this isolated reader.
+            with self._bucket_path_index_guard:
+                self._bucket_path_index.clear()
+                self._bucket_path_index_ready = False
+
         with self._bucket_path_index_guard:
             path = self._bucket_path_index.get(bucket_id)
             if path and os.path.isfile(path):
@@ -4106,6 +4123,19 @@ class BucketManager:
             # Normalize the metadata object as one graph so aliases shared by
             # different top-level keys cannot reset the node/depth budgets.
             metadata = self._normalize_metadata_value(dict(post.metadata))
+            if self.config.get("read_only", False):
+                # Legacy normalizers persist warning events on bad numbers.
+                # Reject before calling them; never repair malformed input here.
+                for field, low, high in (
+                    ("importance", 1, 10), ("valence", 0, 1),
+                    ("arousal", 0, 1), ("model_valence", 0, 1), ("weight", 0, 1),
+                ):
+                    if field in metadata:
+                        value = float(metadata[field])
+                        if not math.isfinite(value) or not low <= value <= high:
+                            raise ValueError(f"read-only memory metadata is invalid: {field}")
+                        if field == "importance":
+                            int(metadata[field])
             domain_value = metadata.get("domain")
             if isinstance(domain_value, str):
                 metadata["domain"] = [domain_value] if domain_value.strip() else []
@@ -4156,4 +4186,6 @@ class BucketManager:
             logger.warning(
                 f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
             )
+            if self.config.get("read_only", False):
+                raise
             return None

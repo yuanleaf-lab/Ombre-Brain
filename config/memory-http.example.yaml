@@ -1,0 +1,17 @@
+# Independent local test configuration. No credential belongs in this file.
+read_only: true
+transport: streamable-http
+host: "127.0.0.1"
+port: 18765
+endpoint: /mcp
+buckets_dir: "C:/ABSOLUTE/PATH/TO/EXISTING/TEST/VAULT"
+embedding:
+  enabled: true
+  api_format: ollama
+  model: bge-m3
+  dim: 1024
+  base_url: "http://127.0.0.1:11434/v1"
+  timeout_seconds: 120
+surfacing:
+  breath_max_results: 10
+  breath_max_tokens: 20000

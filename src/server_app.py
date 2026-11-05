@@ -533,6 +533,7 @@ class RuntimeLifecycle:
     """Own background service startup and shutdown for one HTTP app lifespan."""
 
     logger: Any
+    read_only: bool = False
     decay_engine: Any = None
     embedding_outbox: Any = None
     you_service: Any = None
@@ -604,6 +605,9 @@ class RuntimeLifecycle:
     async def start(self) -> None:
         if self._started:
             return
+        if self.read_only:
+            self._started = True
+            return
         self._started = True
         self._start_optional_services()
         await self._run_async_step(
@@ -628,6 +632,9 @@ class RuntimeLifecycle:
 
     async def stop(self) -> None:
         if not self._started:
+            return
+        if self.read_only:
+            self._started = False
             return
         self._started = False
 

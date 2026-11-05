@@ -77,6 +77,8 @@ from tools import you as _t_you
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
+if config.get("read_only"):
+    raise RuntimeError("read_only requires the isolated memory MCP entry point; the full OB server is disabled")
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
 

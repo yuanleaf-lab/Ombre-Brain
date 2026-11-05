@@ -293,6 +293,8 @@ class DeletionRequestStore:
 
     async def reconcile_pending(self) -> int:
         """Durably supersede requests whose target left the active bucket set."""
+        if getattr(self.bucket_mgr, "config", {}).get("read_only", False):
+            raise PermissionError("read-only mode forbids deletion request reconciliation")
         async with _filesystem_turn(self.base_dir, "human-deletion-requests"):
             state = self._load()
             changed = 0
@@ -356,6 +358,8 @@ class DeletionRequestStore:
             return {"ok": True, "decision": decision, "bucket_id": record["bucket_id"]}
 
     async def render_pending_batch(self) -> str:
+        if getattr(self.bucket_mgr, "config", {}).get("read_only", False):
+            return ""
         await self.reconcile_pending()
         items = []
         for record in self.pending_with_buckets():

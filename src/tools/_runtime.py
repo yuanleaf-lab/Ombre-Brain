@@ -98,6 +98,8 @@ def run_v3_capability(
 
 def record_v3_tool_event(tool_name: str, payload: dict[str, Any] | None = None) -> Any:
     """Record a legacy tool call in the v3 side channel without affecting output."""
+    if config and config.get("read_only", False):
+        return None
     runtime = globals().get("v3_runtime")
     recorder = getattr(runtime, "record_tool_event", None)
     if not callable(recorder):

@@ -46,6 +46,8 @@ from .search import surface_search
 
 
 async def _with_deletion_requests(body: str) -> str:
+    if rt.config.get("read_only", False):
+        return body
     store = getattr(rt, "deletion_requests", None)
     batch = await store.render_pending_batch() if store is not None else ""
     return f"{batch}\n\n{body}" if batch and body else (batch or body)
@@ -61,6 +63,8 @@ async def _with_them(body: str, query: str = "") -> str:
     只挂在浮现与检索两条路上。catalog / feel / plan / importance 是定向通道，
     问的是特定的东西，往里塞一段人物补注只是噪音。
     """
+    if rt.config.get("read_only", False):
+        return body
     service = getattr(rt, "them_service", None)
     if service is None:
         return body
@@ -127,9 +131,10 @@ async def dispatch(
     # 不带 query 时参数被静默丢弃——收下了、schema 也认，就是没人用它。
     created_from, created_to = parse_created_range(date_from, date_to)
 
-    if rt.mark_op:
+    if rt.mark_op and not rt.config.get("read_only", False):
         rt.mark_op("breath")
-    rt.record_v3_tool_event("breath", {
+    if not rt.config.get("read_only", False):
+        rt.record_v3_tool_event("breath", {
         "query": query,
         "max_tokens": max_tokens,
         "domain": domain,
@@ -142,8 +147,8 @@ async def dispatch(
         "date_from": date_from,
         "date_to": date_to,
         "quotes": quotes,
-    })
-    await rt.decay_engine.ensure_started()
+        })
+        await rt.decay_engine.ensure_started()
 
     surfacing_cfg = rt.config.get("surfacing", {}) or {}
     default_results = int(surfacing_cfg.get("breath_max_results") or 20)

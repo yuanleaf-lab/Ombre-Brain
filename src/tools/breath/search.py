@@ -139,6 +139,10 @@ async def _semantic_scores(query: str, top_k: int) -> tuple[dict[str, float], st
     """Run the vector query once and return scores plus an optional notice."""
     engine = rt.embedding_engine
     if not engine or not getattr(engine, "enabled", False):
+        if rt.config.get("read_only", False):
+            if (rt.config.get("embedding") or {}).get("enabled") is not False:
+                raise RuntimeError("read-only semantic engine unavailable; fallback refused")
+            return {}, "[只读模式：语义检索已显式关闭，仅使用字面/模糊匹配。]"
         rt.logger.warning("breath semantic search unavailable; using keyword/BM25 only")
         return {}, _SEMANTIC_DISABLED_NOTE
 
@@ -150,6 +154,8 @@ async def _semantic_scores(query: str, top_k: int) -> tuple[dict[str, float], st
             pairs = await engine.search_similar(query, top_k=top_k)
         return {bucket_id: float(score) for bucket_id, score in pairs}, ""
     except Exception as exc:
+        if rt.config.get("read_only", False):
+            raise RuntimeError("read-only semantic search failed; fallback refused") from exc
         rt.logger.warning(
             f"breath semantic search failed; using keyword/BM25 only: "
             f"{type(exc).__name__}: {exc}"
@@ -163,6 +169,13 @@ def _semantic_diagnostics(
     semantic_notice: str,
 ) -> dict:
     """收集本次检索的可重建索引状态；不记录查询原文。"""
+    if rt.config.get("read_only", False):
+        return {
+            "query_hash": hashlib.sha256(query.encode("utf-8")).hexdigest()[:12],
+            "semantic_available": not bool(semantic_notice),
+            "vector_candidates": len(vector_scores),
+            "engine": {}, "outbox": {},
+        }
     engine_status: dict = {}
     status_reader = getattr(rt.embedding_engine, "status", None)
     if callable(status_reader):
@@ -255,6 +268,8 @@ async def surface_search(
             else await rt.bucket_mgr.get(exact_id)
         )
     except Exception as exc:
+        if rt.config.get("read_only", False):
+            raise RuntimeError("read-only exact memory lookup failed") from exc
         rt.logger.warning(
             f"breath exact bucket lookup failed; continuing with search: "
             f"{type(exc).__name__}: {exc}"
@@ -301,7 +316,7 @@ async def surface_search(
             # 3.6.0：按完整 ID 取桶同样只读。这条路径存在的理由就是「改之前先读一眼
             # 磁盘上的原文」（见上方注释），那是最不该被算作强化的一次读取——
             # 越是要改它，越会先读它，读一次涨一次权重是纯粹的自我实现。
-            if rt.fire_webhook:
+            if rt.fire_webhook and not rt.config.get("read_only", False):
                 await rt.fire_webhook(
                     "breath",
                     {"mode": "exact_id", "matches": 1, "chars": len(rendered)},
@@ -312,6 +327,10 @@ async def surface_search(
         query, top_k=max(max_results, _VECTOR_QUERY_TOPK)
     )
     semantic_diag = _semantic_diagnostics(query, vector_scores, semantic_notice)
+    if rt.config.get("read_only", False):
+        semantic_notice = (semantic_notice + "\n" if semantic_notice else "") + (
+            "[只读模式：BM25 自动构建已禁用；使用字面/模糊匹配及已启用的语义查询。]"
+        )
     rt.logger.info("op=breath_search phase=semantic diagnostics=%s", semantic_diag)
 
     search_kwargs = {
@@ -334,6 +353,8 @@ async def surface_search(
             matches = await rt.bucket_mgr.search(query, **search_kwargs)
     except Exception as e:
         rt.logger.error(f"Search failed / 检索失败: {e}")
+        if rt.config.get("read_only", False):
+            raise RuntimeError("read-only keyword search failed") from e
         return "检索过程出错，请稍后重试。"
 
     eligible_matches = []
@@ -480,7 +501,7 @@ async def surface_search(
         if budget_blocked:
             text = f"{semantic_notice}\n{_BUDGET_NOTICE}" if semantic_notice else _BUDGET_NOTICE
             return _append_id_block(text, [], call_mode, omitted_by_policy, with_ids)
-        if rt.fire_webhook:
+        if rt.fire_webhook and not rt.config.get("read_only", False):
             await rt.fire_webhook("breath", {"mode": "empty", "matches": 0})
         empty_text = (
             f"没有匹配到「{query}」相关的记忆。\n"
@@ -498,7 +519,7 @@ async def surface_search(
         notices.append(_BUDGET_NOTICE)
     if notices:
         final_text = "\n".join(notices + [final_text])
-    if rt.fire_webhook:
+    if rt.fire_webhook and not rt.config.get("read_only", False):
         await rt.fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
     return _append_id_block(
         final_text,
