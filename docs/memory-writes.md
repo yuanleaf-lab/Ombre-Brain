@@ -86,6 +86,12 @@ server. The HTTP application factory reuses the existing authenticated SDK app.
 4. The durable receipt is returned. Further identical calls return that receipt
    without calling OB again. Reusing an ID for another payload is rejected.
 
+Approval records the verified body digest separately. The journal verifies the
+body and its approval digest before claiming the request in the same transaction.
+The schema upgrade preserves existing rows and receipts. An older approved row
+without an independent approval digest cannot be claimed. Submit it with a new
+request ID and review it again. Pending rows can still be reviewed normally.
+
 The host account, private config and journal directory form the trust boundary.
 Untrusted automation must not have filesystem access to that directory or an
 interactive operator terminal. This is not a sandbox against a compromised

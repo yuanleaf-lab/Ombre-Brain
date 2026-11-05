@@ -12,6 +12,7 @@ import sqlite3
 import os
 import subprocess
 import sys
+import time
 from unittest.mock import patch, AsyncMock
 
 from memory_extended_fixture import ExtendedFixture, ALL_READS
@@ -19,7 +20,7 @@ from memory_stdio import MemoryRuntime, validate_settings
 from memory_write_service import WriteCoordinator, WriteSettings
 from memory_write_executor import execute_approved
 from memory_write_executor import ReviewedManager, ExistingEmbeddingEngine
-from memory_write_policy import WRITE_TOOLS, revision
+from memory_write_policy import WRITE_TOOLS, canonical, revision
 from memory_write_entry import validate_write_settings, create_write_server
 
 from memory_write_policy import validate_request
@@ -106,6 +107,36 @@ class JournalTests(unittest.TestCase):
             results = list(pool.map(lambda _: self.store.claim('req-1'), range(4)))
         self.assertEqual(sum(r is not None for r in results), 1)
 
+    def test_legacy_journal_keeps_history_without_granting_unbound_approval(self):
+        path = self.store.path.with_name('legacy.sqlite3')
+        body = canonical({'vault': 'synthetic-vault', 'tool': 'memory_write',
+                          'payload': {'content': 'legacy event'}, 'observations': {}})
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        reviewed = time.time()
+        receipt = {'status': 'succeeded'}
+        rows = [
+            ('legacy-approved', digest, body, 'approved', reviewed - 1, reviewed, None),
+            ('legacy-finished', digest, body, 'finished', reviewed - 1, reviewed, canonical(receipt)),
+            ('legacy-pending', digest, body, 'pending', reviewed - 1, None, None),
+        ]
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('CREATE TABLE requests(id TEXT PRIMARY KEY, digest TEXT NOT NULL, body TEXT NOT NULL, '
+                       'state TEXT NOT NULL, created REAL NOT NULL, reviewed REAL, receipt TEXT)')
+            db.executemany('INSERT INTO requests VALUES(?,?,?,?,?,?,?)', rows)
+
+        WriteJournal(path, 'synthetic-vault')
+        migrated = WriteJournal(path, 'synthetic-vault')  # Reopening must preserve the migration.
+        with migrated.connect() as db:
+            stored = db.execute('SELECT id,digest,body,state,created,reviewed,receipt FROM requests ORDER BY id')
+            self.assertEqual([tuple(row) for row in stored], rows)
+        self.assertEqual(migrated.get('legacy-finished')['receipt'], receipt)
+        self.assertIsNone(migrated.get('legacy-approved')['reviewed_digest'])
+        with self.assertRaisesRegex(PermissionError, 'approval digest'):
+            migrated.claim('legacy-approved')
+        self.assertEqual(migrated.get('legacy-approved')['state'], 'approved')
+        migrated.review('legacy-pending', digest, approve=True)
+        self.assertEqual(migrated.claim('legacy-pending')['reviewed_digest'], digest)
+
 
 class NativeWriteTests(ExtendedFixture, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -127,6 +158,44 @@ class NativeWriteTests(ExtendedFixture, unittest.IsolatedAsyncioTestCase):
         finally:
             await self.runtime.open()
         return self.coordinator.journal.get(request_id)
+
+    async def assert_tampering_cannot_write(self, *, approved, replace_digest=False):
+        journal = self.coordinator.journal
+        request_id = 'tamper-test'
+        before = self.snapshot()
+        await self.coordinator.submit('memory_write', request_id, {'content': 'original synthetic event'})
+        row = journal.get(request_id)
+        if approved:
+            journal.review(request_id, row['digest'], approve=True)
+        row['body']['payload']['content'] = 'tampered synthetic event'
+        body = canonical(row['body'])
+        digest = hashlib.sha256(body.encode()).hexdigest() if replace_digest else row['digest']
+        with journal.connect() as db:
+            db.execute('UPDATE requests SET body=?,digest=? WHERE id=?', (body, digest, request_id))
+
+        if replace_digest:
+            self.assertEqual(journal.get(request_id)['digest'], digest)
+        else:
+            with self.assertRaisesRegex(PermissionError, 'body digest'):
+                journal.get(request_id)
+        if not approved:
+            with self.assertRaisesRegex(PermissionError, 'body digest'):
+                journal.review(request_id, row['digest'], approve=True)
+        with self.assertRaisesRegex(PermissionError, 'approval digest' if replace_digest else 'body digest'):
+            await execute_approved(self.settings, request_id)
+        with journal.connect() as db:
+            stored = db.execute('SELECT state,receipt FROM requests WHERE id=?', (request_id,)).fetchone()
+        self.assertEqual(tuple(stored), ('approved' if approved else 'pending', None))
+        self.assertEqual(self.snapshot(), before)
+
+    async def test_tampered_body_before_review_cannot_write(self):
+        await self.assert_tampering_cannot_write(approved=False)
+
+    async def test_tampered_body_after_review_cannot_write(self):
+        await self.assert_tampering_cannot_write(approved=True)
+
+    async def test_tampered_body_and_digest_cannot_reuse_approval(self):
+        await self.assert_tampering_cannot_write(approved=True, replace_digest=True)
 
     async def test_pending_hold_has_no_vault_effect_then_approved_hold_is_native(self):
         before = self.snapshot()

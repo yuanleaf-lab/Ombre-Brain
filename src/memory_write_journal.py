@@ -4,6 +4,7 @@ This journal is not a memory engine. It is private local control-plane data.
 Only the operator CLI calls review(); there is deliberately no MCP review API.
 """
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import re
@@ -12,6 +13,10 @@ import time
 from contextlib import contextmanager
 
 from memory_write_policy import canonical
+
+
+def _digest_matches(actual, expected):
+    return isinstance(expected, str) and expected.isascii() and hmac.compare_digest(actual, expected)
 
 
 class WriteJournal:
@@ -23,9 +28,15 @@ class WriteJournal:
         with self.connect() as db:
             if db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                 raise ValueError('write journal is corrupt')
+            db.execute('BEGIN IMMEDIATE')
             db.execute('CREATE TABLE IF NOT EXISTS requests('
                        'id TEXT PRIMARY KEY, digest TEXT NOT NULL, body TEXT NOT NULL, '
-                       'state TEXT NOT NULL, created REAL NOT NULL, reviewed REAL, receipt TEXT)')
+                       'state TEXT NOT NULL, created REAL NOT NULL, reviewed REAL, receipt TEXT, '
+                       'reviewed_digest TEXT)')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(requests)')}
+            if 'reviewed_digest' not in columns:
+                # A legacy approval has no independently recorded body digest.
+                db.execute('ALTER TABLE requests ADD COLUMN reviewed_digest TEXT')
 
     @contextmanager
     def connect(self):
@@ -40,14 +51,24 @@ class WriteJournal:
 
     def get(self, request_id):
         with self.connect() as db:
-            row = db.execute('SELECT * FROM requests WHERE id=?', (request_id,)).fetchone()
+            return self._read_request(db, request_id)
+
+    def _read_request(self, db, request_id):
+        row = db.execute('SELECT * FROM requests WHERE id=?', (request_id,)).fetchone()
         if row is None:
             raise ValueError('unknown request')
         result = dict(row)
-        result['body'] = json.loads(result['body'])
-        result['receipt'] = json.loads(result['receipt']) if result['receipt'] else None
-        if result['body']['vault'] != self.identity:
+        try:
+            body = json.loads(result['body'])
+            digest = hashlib.sha256(canonical(body).encode()).hexdigest()
+        except (TypeError, ValueError, RecursionError):
+            raise PermissionError('invalid request body') from None
+        if not isinstance(body, dict) or not _digest_matches(digest, result['digest']):
+            raise PermissionError('request body digest does not match')
+        if body.get('vault') != self.identity:
             raise PermissionError('journal belongs to another Vault')
+        result['body'] = body
+        result['receipt'] = json.loads(result['receipt']) if result['receipt'] else None
         return result
 
     def submit(self, request_id, tool, payload, observations):
@@ -67,21 +88,32 @@ class WriteJournal:
         return row
 
     def review(self, request_id, digest, *, approve):
-        row = self.get(request_id)
-        if row['digest'] != digest or type(approve) is not bool:
-            raise ValueError('review digest does not match')
         with self.connect() as db:
-            changed = db.execute('UPDATE requests SET state=?,reviewed=? WHERE id=? AND digest=? AND state=?',
-                                 ('approved' if approve else 'rejected', time.time(), request_id, digest, 'pending')).rowcount
-        if not changed:
-            raise ValueError('request is no longer pending')
+            db.execute('BEGIN IMMEDIATE')
+            row = self._read_request(db, request_id)
+            if not _digest_matches(row['digest'], digest) or type(approve) is not bool:
+                raise ValueError('review digest does not match')
+            if row['state'] != 'pending':
+                raise ValueError('request is no longer pending')
+            db.execute('UPDATE requests SET state=?,reviewed=?,reviewed_digest=? WHERE id=?',
+                       ('approved' if approve else 'rejected', time.time(),
+                        row['digest'] if approve else None, request_id))
 
     def claim(self, request_id):
-        self.get(request_id)
         with self.connect() as db:
-            changed = db.execute('UPDATE requests SET state=? WHERE id=? AND state=? AND reviewed>?',
-                                 ('running', request_id, 'approved', time.time()-86400)).rowcount
-        return self.get(request_id) if changed else None
+            db.execute('BEGIN IMMEDIATE')
+            row = self._read_request(db, request_id)
+            if row['state'] != 'approved':
+                return None
+            if not _digest_matches(row['digest'], row['reviewed_digest']):
+                raise PermissionError('request approval digest does not match')
+            reviewed = row['reviewed']
+            now = time.time()
+            if not isinstance(reviewed, (int, float)) or not now - 86400 < reviewed <= now:
+                return None
+            db.execute('UPDATE requests SET state=? WHERE id=?', ('running', request_id))
+            row['state'] = 'running'
+            return row
 
     def finish(self, request_id, receipt):
         with self.connect() as db:
