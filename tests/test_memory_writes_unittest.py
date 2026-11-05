@@ -7,6 +7,7 @@ import copy
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 import os
 import subprocess
@@ -284,6 +285,77 @@ class NativeWriteTests(ExtendedFixture, unittest.IsolatedAsyncioTestCase):
             queue.assert_not_called()
             bm25.assert_not_called()
         self.assertFalse((self.vault/'dehydration_cache.db').exists())
+
+    async def assert_reviewed_create_skips_relations(self, tool, payload):
+        existing = self.vault/'dynamic'/'ordinary.md'
+        before = existing.read_bytes()
+        await self.coordinator.submit(tool, 'no-auto-relations', payload)
+        with patch('tools._common.link_new_bucket', new_callable=AsyncMock) as link:
+            row = await self.execute('no-auto-relations')
+            link.assert_not_called()
+
+        self.assertEqual(row['receipt']['status'], 'succeeded')
+        mutation, = row['receipt']['items'][0]['mutations']
+        self.assertEqual(mutation['action'], 'created')
+        self.assertEqual(existing.read_bytes(), before)
+        created = await self.runtime.view.get(mutation['bucket_id'])
+        self.assertFalse(created['metadata'].get('relation_links'))
+
+    async def test_reviewed_memory_write_does_not_link_new_bucket(self):
+        await self.assert_reviewed_create_skips_relations(
+            'memory_write', {'content': 'reviewed hold without automatic relationships'})
+
+    async def test_reviewed_memory_grow_does_not_link_new_bucket(self):
+        await self.assert_reviewed_create_skips_relations(
+            'memory_grow', {'items': [{'content': 'reviewed grow without automatic relationships'}]})
+
+    async def test_native_create_still_persists_both_automatic_relation_links(self):
+        from bucket_manager import BucketManager
+        from tools import _runtime as rt
+        from tools._common import merge_or_create
+        from tools._relation_link import link_new_bucket
+
+        config = dict(self.settings.read.config, read_only=False)
+        manager = BucketManager(config, None)
+        completed = asyncio.Event()
+
+        async def track_link(bucket_id, content):
+            try:
+                await link_new_bucket(bucket_id, content)
+            finally:
+                completed.set()
+
+        inferred = [{'target_bucket_id': 'ordinary', 'type': 'related_to', 'label': '',
+                     'status': 'active', 'auto': True, 'score': 0.9}]
+        with patch.multiple(rt, config=config, bucket_mgr=manager, embedding_engine=None,
+                            logger=logging.getLogger('synthetic-native-relation')), \
+                patch('tools._relation_link.infer_links_for', return_value=inferred), \
+                patch('tools._common.link_new_bucket', side_effect=track_link) as link:
+            content = 'native memory with automatic relationships'
+            bucket_id, merged, _ = await merge_or_create(content, [], 5, ['test'], .5, .3)
+            self.assertFalse(merged)
+            link.assert_called_once_with(bucket_id, content)
+            await asyncio.wait_for(completed.wait(), timeout=5)
+
+        for source, target in ((bucket_id, 'ordinary'), ('ordinary', bucket_id)):
+            stored = await manager.get(source)
+            relation, = stored['metadata']['relation_links']
+            self.assertEqual(relation['target_bucket_id'], target)
+            self.assertTrue(relation['auto'])
+
+    async def test_adapter_short_grow_does_not_start_suggestion_tasks(self):
+        from tools import _runtime as rt
+        from tools.grow.shortpath import grow_shortpath
+
+        metadata = type('Metadata', (), {'analyze': AsyncMock(return_value={})})()
+        with patch.multiple(rt, config={'memory_write_adapter': True}, dehydrator=metadata,
+                            logger=logging.getLogger('synthetic-short-grow')), \
+                patch('tools.grow.shortpath.merge_or_create', return_value=('new-id', False, '')), \
+                patch('tools.grow.shortpath.check_plan_resolution') as plans, \
+                patch('tools.grow.shortpath.check_duplicate_for') as duplicates:
+            await grow_shortpath('short synthetic event')
+            plans.assert_not_called()
+            duplicates.assert_not_called()
 
     async def test_plan_resolution_cascade_requires_reviewed_link_versions(self):
         self.put('plans', 'linked-plan', 'plan', 'reviewed linked promise', status='active', related_bucket='ordinary')
