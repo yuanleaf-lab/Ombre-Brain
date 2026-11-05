@@ -827,7 +827,7 @@ class BucketManager:
         return [self.permanent_dir, self.dynamic_dir,
                 self.feel_dir, self.plan_dir, self.letter_dir]
 
-    def _iter_md_files(self, dirs: list[str]):
+    def _iter_md_files(self, dirs: list[str], *, strict: bool = False):
         """递归遍历多个目录下的 *.md，yield (root, filename, full_path)。
 
         原本中 5 处 ``for root, _, files in os.walk(…): for f in files: if not f.endswith('.md'): continue`` 同表现。。。
@@ -837,7 +837,7 @@ class BucketManager:
             if not os.path.exists(dir_path):
                 continue
             def onerror(exc):
-                if self.config.get("read_only", False):
+                if strict or self.config.get("read_only", False):
                     raise exc
             for root, _, files in os.walk(dir_path, onerror=onerror):
                 for fname in files:
@@ -1774,20 +1774,32 @@ class BucketManager:
         self,
         content: str,
         domain_filter: Optional[list[str]] = None,
+        *,
+        active_plan: bool = False,
     ) -> Optional[dict]:
         """Read Markdown directly for an exact match, bypassing derived caches."""
         expected = self._sanitize_text(content)
+        if active_plan:
+            expected = expected.replace("\r\n", "\n").replace("\r", "\n").strip()
         filter_set = {
             str(domain).strip().lower()
             for domain in (domain_filter or [])
             if str(domain).strip()
         }
-        for _root, _fname, file_path in self._iter_md_files(self._active_dirs):
-            bucket = self._load_bucket(file_path)
-            if not bucket or bucket.get("content") != expected:
+        for _root, _fname, file_path in self._iter_md_files(self._active_dirs, strict=active_plan):
+            bucket = self._load_bucket(file_path, strict=active_plan)
+            if not bucket:
                 continue
             metadata = bucket.get("metadata", {})
             if metadata.get("deleted_at"):
+                continue
+            actual = bucket.get("content")
+            if active_plan:
+                if (metadata.get("type") != "plan" or metadata.get("status", "active") != "active"
+                        or parse_bool(metadata.get("tombstone"), default=False)):
+                    continue
+                actual = (actual or "").strip()
+            if actual != expected:
                 continue
             domains = metadata.get("domain") or []
             if isinstance(domains, str):
@@ -4113,7 +4125,7 @@ class BucketManager:
 
     _normalize_metadata_value = staticmethod(_mn._normalize_metadata_value)
 
-    def _load_bucket(self, file_path: str) -> Optional[dict]:
+    def _load_bucket(self, file_path: str, *, strict: bool = False) -> Optional[dict]:
         """
         Parse a Markdown file and return structured bucket data.
         解析 Markdown 文件，返回桶的结构化数据。
@@ -4123,19 +4135,31 @@ class BucketManager:
             # Normalize the metadata object as one graph so aliases shared by
             # different top-level keys cannot reset the node/depth budgets.
             metadata = self._normalize_metadata_value(dict(post.metadata))
-            if self.config.get("read_only", False):
+            if strict or self.config.get("read_only", False):
                 # Legacy normalizers persist warning events on bad numbers.
                 # Reject before calling them; never repair malformed input here.
                 for field, low, high in (
                     ("importance", 1, 10), ("valence", 0, 1),
                     ("arousal", 0, 1), ("model_valence", 0, 1), ("weight", 0, 1),
+                    ("activation_count", 0, math.inf),
                 ):
-                    if field in metadata:
-                        value = float(metadata[field])
-                        if not math.isfinite(value) or not low <= value <= high:
-                            raise ValueError(f"read-only memory metadata is invalid: {field}")
-                        if field == "importance":
-                            int(metadata[field])
+                    if field not in metadata:
+                        continue
+                    raw_value = metadata[field]
+                    message = f"invalid memory metadata: {field}"
+                    try:
+                        value = float(raw_value)
+                        normalized = int(raw_value) if field == "importance" else value
+                    except (TypeError, ValueError, OverflowError):
+                        raise ValueError(message) from None
+                    if (
+                        isinstance(raw_value, bool)
+                        or not math.isfinite(value)
+                        or not low <= value <= high
+                        or normalized != value
+                    ):
+                        raise ValueError(message)
+                    metadata[field] = normalized
             domain_value = metadata.get("domain")
             if isinstance(domain_value, str):
                 metadata["domain"] = [domain_value] if domain_value.strip() else []
@@ -4183,9 +4207,9 @@ class BucketManager:
                 "path": file_path,
             }
         except Exception as e:
+            if strict or self.config.get("read_only", False):
+                raise
             logger.warning(
                 f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
             )
-            if self.config.get("read_only", False):
-                raise
             return None

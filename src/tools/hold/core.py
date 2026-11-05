@@ -100,9 +100,10 @@ async def store_core(
     )
 
     action = "合并→" if is_merged else "新建→"
-    asyncio.create_task(check_plan_resolution(content, source_bucket_id=result_name))
-    if not is_merged:
-        asyncio.create_task(check_duplicate_for(result_name, content))
+    if not rt.config.get("memory_write_adapter", False):
+        asyncio.create_task(check_plan_resolution(content, source_bucket_id=result_name))
+        if not is_merged:
+            asyncio.create_task(check_duplicate_for(result_name, content))
     result = f"{action}{result_name} {','.join(str(d) for d in final_domain if d is not None)}"
     if embed_warn:
         result += f"\n⚠️ {embed_warn}"

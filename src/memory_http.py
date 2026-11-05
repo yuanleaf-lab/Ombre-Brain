@@ -34,6 +34,10 @@ class HTTPSettings:
 
 def load_http_settings(path: Path, token: str | None = None) -> HTTPSettings:
     raw = yaml.safe_load(Path(path).read_text(encoding='utf-8'))
+    return validate_http_settings(raw, token)
+
+
+def validate_http_settings(raw, token: str | None = None) -> HTTPSettings:
     if not isinstance(raw, dict):
         raise ValueError('HTTP memory configuration must be a mapping')
     supplied = os.environ.get(HTTP_TOKEN_ENV, '') if token is None else token
@@ -80,11 +84,11 @@ class BearerMiddleware:
         await self.app(scope, receive, send)
 
 
-def create_http_app(settings: HTTPSettings):
-    runtime = MemoryRuntime(settings.memory)
+def create_http_app(settings: HTTPSettings, *, server_factory=None, runtime_factory=None):
+    runtime = (runtime_factory or MemoryRuntime)(settings.memory)
     # HTTP sessions have their own SDK lifespans; shared read runtime must be
     # opened exactly once at application startup, not once per request/session.
-    server = create_server(settings.memory, runtime=runtime, manage_runtime_lifespan=False)
+    server = (server_factory or create_server)(settings.memory, runtime=runtime, manage_runtime_lifespan=False)
     server.settings.host = settings.host
     server.settings.port = settings.port
     server.settings.streamable_http_path = settings.endpoint

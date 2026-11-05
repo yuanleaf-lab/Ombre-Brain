@@ -316,7 +316,7 @@ class Dehydrator:
     （根据 BEHAVIOR_SPEC.md 三、降级行为表决策：无本地降级）
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, initialize_cache: bool = True):
         # --- Read dehydration API config / 读取脱水 API 配置 ---
         dehy_cfg = config.get("dehydration", {})
         self.api_key = dehy_cfg.get("api_key", "")
@@ -382,12 +382,13 @@ class Dehydrator:
         # --- SQLite 脱水缓存：content hash → summary ---
         db_path = os.path.join(config["buckets_dir"], "dehydration_cache.db")
         self.cache_db_path = db_path
-        self._cache_conn: sqlite3.Connection = self._init_cache_db()
+        self._cache_conn: sqlite3.Connection | None = self._init_cache_db() if initialize_cache else None
         # Keep the cache connection persistent for hot-path lookups, but do not
         # leak the Windows file handle when a runtime/test instance is released.
         # ``weakref.finalize`` also runs during interpreter shutdown in reverse
         # creation order, before an enclosing temporary vault is cleaned up.
-        self._cache_finalizer = weakref.finalize(self, self._cache_conn.close)
+        self._cache_finalizer = weakref.finalize(
+            self, self._cache_conn.close if self._cache_conn is not None else lambda: None)
 
     def close(self) -> None:
         """Close the persistent cache connection; safe to call repeatedly."""

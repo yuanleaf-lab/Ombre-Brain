@@ -1,0 +1,32 @@
+# Independent opt-in entry: memory_write_entry.py serve --config <private copy>
+# No production path, runtime credential or enabled write permission is supplied.
+read_only: true
+transport: stdio
+buckets_dir: "C:/ABSOLUTE/PATH/TO/EXISTING/TEST/VAULT"
+auth:
+  token_sha256: "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS"
+embedding:
+  enabled: true
+  api_format: ollama
+  model: bge-m3
+  dim: 1024
+  base_url: "http://127.0.0.1:11434/v1"
+  timeout_seconds: 120
+permissions:
+  tools:
+    - memory_bootstrap
+    - memory_search
+    - memory_read
+    - memory_catalog
+    - memory_status
+    - memory_feel_search
+    - memory_plan_list
+    - memory_self_read
+  write_enabled: false
+writes:
+  enabled: false
+# To authorize proposals, replace the entire writes section in a private copy:
+# writes:
+#   enabled: true
+#   tools: [memory_write, memory_grow, memory_update, memory_plan_create, memory_plan_update]
+#   journal_path: "C:/PRIVATE/EXISTING/USER-ONLY-DIRECTORY/reviews.sqlite3"

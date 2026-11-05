@@ -262,7 +262,8 @@ class MemoryRuntime:
             self.view.exact_snapshot = None
 
 
-def create_server(settings: MemorySettings, *, runtime=None, manage_runtime_lifespan=True) -> FastMCP:
+def create_server(settings: MemorySettings, *, runtime=None, manage_runtime_lifespan=True,
+                  instructions=None) -> FastMCP:
     import asyncio
     runtime = runtime if runtime is not None else MemoryRuntime(settings)
     permissions = runtime.permissions
@@ -282,7 +283,7 @@ def create_server(settings: MemorySettings, *, runtime=None, manage_runtime_life
             await runtime.close()
 
     server = FastMCP('memory', log_level='WARNING', lifespan=lifespan,
-                     instructions='Read-only external memory. Use memory_bootstrap for initial context; '
+                     instructions=instructions or 'Read-only external memory. Use memory_bootstrap for initial context; '
                      'use memory_search to find ordinary memories and memory_read for an exact ID.')
     annotations = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
                                   idempotentHint=False, openWorldHint=True)
